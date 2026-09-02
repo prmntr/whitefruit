@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# machine-specific paths and preferences
+settings.json
+
+# your own playlists -- see playlists.example.txt
+playlists.txt
+
+# exported browser cookies: as sensitive as a password
+cookies.txt
+*.cookies
