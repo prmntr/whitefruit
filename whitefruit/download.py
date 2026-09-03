@@ -15,9 +15,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import quote
 
 from . import settings as settings_mod
+from . import sources
 from .term import C, status
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -69,7 +73,11 @@ def sanitize_dirname(name: str) -> str:
 
 
 def get_playlist_info(ytdlp: str, url: str, cfg: dict = None):
-    """Return (dirname, [(id, title), ...]) for available tracks in the playlist.
+    """Return (dirname, [(id, title), ...], [nested playlist url, ...]).
+
+    A library page (youtube.com/feed/playlists) lists playlists rather than
+    tracks; those come back as the third element for the caller to work
+    through one by one. An ordinary playlist leaves it empty.
 
     Uses --dump-json (not --get-filename/--print) because on this setup yt-dlp's
     printed output is mangled when piped (not a real console), silently dropping
@@ -78,6 +86,7 @@ def get_playlist_info(ytdlp: str, url: str, cfg: dict = None):
     r = run([ytdlp, "--flat-playlist", "--dump-json", "--ignore-errors"]
             + cookie_args(cfg or {}) + [url])
     entries = []
+    nested = []
     playlist_title = None
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -89,9 +98,13 @@ def get_playlist_info(ytdlp: str, url: str, cfg: dict = None):
         title = e.get("title") or ""
         if not e.get("id") or title in ("[Private video]", "[Deleted video]"):
             continue
+        # A tab entry is another playlist, not a track.
+        if e.get("ie_key") == "YoutubeTab" and e.get("url"):
+            nested.append(e["url"])
+            continue
         entries.append((e["id"], title))
     dirname = sanitize_dirname(playlist_title) if playlist_title else "Unknown Playlist"
-    return dirname, entries
+    return dirname, entries, nested
 
 
 def scan_existing(target_dir: Path, ext: str = None):
@@ -114,9 +127,24 @@ def scan_existing(target_dir: Path, ext: str = None):
 
 def reconcile(target_dir: Path, current_ids: set, ext: str, cfg: dict, name: str):
     """Drop local tracks that are no longer in the playlist, so the folder
-    keeps mirroring it when songs are removed upstream."""
+    keeps mirroring it when songs are removed upstream.
+
+    Returns (removed, held back). Deleting rests entirely on the source list
+    being complete, and it is not: iTunes fills its cloud library in
+    progressively, so a read taken too early looks exactly like a playlist
+    that genuinely shrank. Anything past ordinary churn is left alone and
+    reported, because guessing wrong here costs audio files. The guard lives
+    here rather than in each caller so every path that deletes is covered.
+    """
     if not cfg.get("remove_deleted", True) or not target_dir.exists():
-        return 0
+        return 0, 0
+    ours = scan_existing(target_dir, None)
+    doomed = [tid for tid in ours if tid not in current_ids]
+    if doomed and len(doomed) > 10 and len(doomed) / max(len(ours), 1) > 0.25:
+        print(f"  {C.YELLOW}[{name}] {len(doomed)} of {len(ours)} files are not in "
+              f"the source any more — too many to trust to one read, so they "
+              f"have been kept.{C.RESET}")
+        return 0, len(doomed)
     removed = 0
     for f in list(target_dir.iterdir()):
         m = FILENAME_RE.match(f.name)
@@ -124,7 +152,7 @@ def reconcile(target_dir: Path, current_ids: set, ext: str, cfg: dict, name: str
             print(f"[{name}] no longer in playlist, removing: {f.name}")
             f.unlink()
             removed += 1
-    return removed
+    return removed, 0
 
 
 def remove_stale_formats(target_dir: Path, ext: str):
@@ -209,17 +237,40 @@ def art_filter(cfg: dict) -> str:
     return f"scale={size}:{size}:force_original_aspect_ratio=decrease"
 
 
-def retag(path: Path, title: str) -> bool:
-    """Set the title tag on an already-encoded file, without re-encoding.
+def read_tag(path: Path, key: str) -> str:
+    """One metadata field out of an existing file."""
+    return (run(["ffprobe", "-v", "error", "-show_entries", f"format_tags={key}",
+                 "-of", "default=nw=1:nk=1", str(path)]).stdout or "").strip()
+
+
+def tag_fields(tags: dict):
+    """ffmpeg -metadata arguments for a tag set.
+
+    Underscore-prefixed keys are whitefruit's own bookkeeping (see
+    sources._entries), not metadata, and must never reach the file.
+    """
+    return [a for k, v in (tags or {}).items() if v and not k.startswith("_")
+            for a in ("-metadata", f"{k}={v}")]
+
+
+def retag(path: Path, tags: dict) -> bool:
+    """Set tags on an already-encoded file, without re-encoding.
 
     Done as its own ffmpeg pass rather than through --postprocessor-args,
-    which can't carry a value containing spaces (see encode_args).
+    which can't carry a value containing spaces (see encode_args). What the
+    source service says wins over what the YouTube upload claims: the upload
+    is usually a video titled with the whole "Artist - Song (Official Video)"
+    line, naming no album at all.
     """
+    # Underscore-prefixed keys are whitefruit's own bookkeeping (see
+    # sources._entries), not metadata to write into the file.
+    fields = tag_fields(tags)
+    if not fields:
+        return True
     tmp = path.with_name(path.stem + ".retag" + path.suffix)
     r = subprocess.run(
         ["ffmpeg", "-y", "-i", str(path), "-map", "0", "-c", "copy",
-         "-map_metadata", "0", "-metadata", f"title={title}",
-         "-loglevel", "error", str(tmp)],
+         "-map_metadata", "0"] + fields + ["-loglevel", "error", str(tmp)],
         capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not tmp.exists():
         tmp.unlink(missing_ok=True)
@@ -228,7 +279,7 @@ def retag(path: Path, title: str) -> bool:
     return True
 
 
-def encode_args(cfg: dict, track_number: int = None, title: str = None):
+def encode_args(cfg: dict, track_number: int = None):
     """yt-dlp flags for the ffmpeg call that produces the audio file."""
     opts = []
     rate = str(cfg.get("sample_rate", "44100"))
@@ -359,7 +410,8 @@ def download(ytdlp: str, url: str, music_dir: Path, playlist_items: str = None,
 
 
 def search_download(ytdlp: str, title: str, vid: str, index: int,
-                    target_dir: Path, cfg: dict) -> bool:
+                    target_dir: Path, cfg: dict, tags: dict = None,
+                    source: str = None):
     """Fetch a track from public YouTube by searching for its title.
 
     Used for tracks the playlist itself won't serve (Premium-only,
@@ -376,6 +428,12 @@ def search_download(ytdlp: str, title: str, vid: str, index: int,
     args = [
         ytdlp, "--ignore-errors", "--color", "always",
         "--no-playlist",
+        # Stop as soon as one result actually downloads. Paired with the
+        # ytsearchN below this means "the best result that works": the top hit
+        # is regularly age-restricted, which needs a signed-in account, and
+        # taking only that one hit reports the song as missing when a perfectly
+        # good upload sits at number two.
+        "--max-downloads", "1",
         "-f", "bestaudio",
         "--extract-audio", "--audio-format", cfg.get("audio_format", "mp3"),
         "--embed-metadata",
@@ -384,37 +442,147 @@ def search_download(ytdlp: str, title: str, vid: str, index: int,
     ]
     if cfg.get("audio_format", "mp3") != "alac":
         args += ["--audio-quality", cfg.get("audio_bitrate", AUDIO_BITRATE)]
-    args += cookie_args(cfg) + encode_args(cfg, track_number=index, title=title)
+    # The playlist position is only a sensible track number when there is no
+    # album to speak of -- a YouTube playlist. For a real album it is the thing
+    # that made iTunes show 19 tracks numbered 1, 13, 48, 63, 197...; the
+    # album's own number comes through `tags` instead, and playlist order is
+    # carried by the iTunes playlist rather than by this tag.
+    args += cookie_args(cfg) + encode_args(
+        cfg, track_number=None if tags else index)
     if cfg.get("embed_art", True):
         args += [
             "--embed-thumbnail", "--convert-thumbnails", "jpg",
             "--postprocessor-args",
             f"ThumbnailsConvertor+ffmpeg_o:-vf {art_filter(cfg)}",
         ]
-    args.append(f"ytsearch1:{title}")
+    def attempt(spec):
+        """Run yt-dlp against one search or link; return (file or None, output)."""
+        proc = subprocess.run(args + spec, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+        if cfg.get("verbose_logging", False):
+            print(proc.stdout)
+        # Trust the filesystem rather than the exit code: --ignore-errors means
+        # a failed search still exits cleanly. Look for files carrying *our* id
+        # rather than diffing the directory before and after -- several of
+        # these run at once, and a diff would hand this track another's file.
+        ours = [f for f in target_dir.iterdir()
+                if f"[{vid}]" in f.name] if target_dir.exists() else []
+        found = [f for f in ours if f.suffix.lower() in settings_mod.ALL_EXTS]
+        # A failed extraction can leave the raw download and thumbnail behind.
+        for leftover in ours:
+            if leftover not in found:
+                leftover.unlink(missing_ok=True)
+        return (found[0] if found else None), (proc.stdout or "") + (proc.stderr or "")
 
-    before = set(target_dir.iterdir()) if target_dir.exists() else set()
-    proc = subprocess.run(args, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace")
-    after = set(target_dir.iterdir()) if target_dir.exists() else set()
+    n = max(1, int(cfg.get("search_results", 3) or 1))
+    if source:
+        specs = [[source]]           # a link the user typed in, taken as-is
+    else:
+        # YouTube Music first. Its results are "art tracks" -- audio-only
+        # uploads carrying real square cover art and proper album metadata --
+        # whereas plain YouTube's best match is the music *video*, whose
+        # thumbnail is a frame of the video and which names no album. That is
+        # the whole reason art came out as vevo stills and screenshots.
+        # '#songs' keeps albums and playlists out of the results, which would
+        # otherwise expand into whole records.
+        specs = []
+        if cfg.get("search_youtube_music", True):
+            specs.append(["--playlist-items", f"1-{n}",
+                          "https://music.youtube.com/search?q="
+                          + quote(title) + "#songs"])
+        # Fall back to plain YouTube: anything unofficial, or simply not on
+        # YouTube Music, only exists there.
+        specs.append([f"ytsearch{n}:{title}"])
+
+    out = ""
+    for spec in specs:
+        got, out = attempt(spec)
+        if got:
+            retag(got, tags or {"title": title})
+            return True, ""
+
+    # Say why, when yt-dlp said why. "Sign in to confirm your age" is by far
+    # the most common one and is fixable (Settings -> cookies), so it deserves
+    # better than being reported as if nothing existed.
+    if "confirm your age" in out or "age-restricted" in out:
+        return False, "age-restricted, needs sign-in"
+    if "Private video" in out or "unavailable" in out:
+        return False, "no usable upload"
+    return False, ""
+
+
+def search_many(ytdlp: str, jobs, target_dir: Path, cfg: dict):
+    """Search-download several tracks at once; returns the (id, title) pairs
+    that landed. `jobs` is [(id, track number, search title, tags or None), ...].
+
+    Each track stays its own yt-dlp process. They are deliberately not folded
+    into one call: a single invocation can only number its outputs with
+    --autonumber, which counts files that actually downloaded, so one search
+    finding nothing would silently shift every later track onto the wrong
+    number and id. The time goes on network and encoding anyway, not on
+    starting processes, so running a few concurrently is the speedup that was
+    actually available.
+    """
+    if not jobs:
+        return [], []
+    workers = max(1, int(cfg.get("search_workers", 4) or 1))
+    if not cfg.get("concurrent_search", True):
+        workers = 1
     if cfg.get("verbose_logging", False):
-        print(proc.stdout)
+        workers = 1  # interleaved yt-dlp output is unreadable
 
-    # Trust the filesystem rather than the exit code: --ignore-errors means a
-    # failed search still exits cleanly.
-    new_files = after - before
-    got = [f for f in new_files if f.suffix.lower() in settings_mod.ALL_EXTS]
-    # A failed extraction can leave the raw download and thumbnail behind.
-    for leftover in new_files:
-        if leftover not in got and leftover.suffix.lower() in (".webm", ".jpg", ".webp", ".m4a.part"):
-            leftover.unlink(missing_ok=True)
-    if not got:
-        return False
-    retag(got[0], title)
-    return True
+    target_dir.mkdir(parents=True, exist_ok=True)
+    total = len(jobs)
+    # Right-aligned so the titles line up in one column however far in we are,
+    # the way the settings screen numbers its entries.
+    width = len(str(total))
+
+    if workers > 1:
+        print(f"  {C.DIM}{workers} downloads at a time. You may notice songs finishing"
+              f"in the wrong order; don't worry about that. The playlist "
+              f"itself at the end keeps its order.{C.RESET}")
+    print(f"  {C.DIM}searching YouTube for {total} track(s)…{C.RESET}", flush=True)
+
+    done, failed = [], []
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {pool.submit(search_download, ytdlp, title, vid, index,
+                               target_dir, cfg, tags): (vid, title)
+                   for vid, index, title, tags in jobs}
+        for n, fut in enumerate(as_completed(pending), 1):
+            vid, title = pending[fut]
+            counter = f"  {C.DIM}[{n:>{width}}/{total}]{C.RESET} "
+            try:
+                ok, note = fut.result()
+            except Exception as e:  # one bad track shouldn't sink the rest
+                ok, note = False, str(e)
+            if ok:
+                status(f"{counter}{C.GREEN}{title}{C.RESET}", done=True)
+                done.append((vid, title))
+            else:
+                why = f" {C.DIM}({note}){C.RESET}" if note else ""
+                status(f"{counter}{C.YELLOW}no result for {title}{C.RESET}{why}",
+                       done=True)
+                failed.append((vid, title, note))
+            # Overwritten by the next finished line; keeps the display from
+            # going quiet while the workers are busy on the ones still running.
+            if n < total:
+                nxt = next((t for f, (_, t) in pending.items()
+                            if not f.done()), None)
+                if nxt:
+                    status(f"  {C.DIM}{' ' * (width * 2 + 4)}processing "
+                           f"{nxt}…{C.RESET}")
+
+    # Wall-clock per track, at whatever concurrency was actually used, which is
+    # what the estimate needs.
+    _rate["secs"] += time.monotonic() - started
+    _rate["tracks"] += total
+    return done, failed
 
 
 def renumber(target_dir: Path, id_to_index: dict):
+    if not target_dir.exists():
+        return
     for f in list(target_dir.iterdir()):
         m = FILENAME_RE.match(f.name)
         if not m:
@@ -457,25 +625,383 @@ def recover_missing(ytdlp: str, target_dir: Path, ext: str, entries: list,
         return []
     arrived = set(scan_existing(target_dir, ext))
     titles_by_id = dict(entries)
-    recovered = []
-    for vid in want_ids:
-        if vid in arrived or vid not in id_to_index:
+    # No tags: a YouTube playlist entry is only a title, and yt-dlp's own
+    # --embed-metadata has already had a better look at the upload than we can.
+    jobs = [(vid, id_to_index[vid], titles_by_id[vid], None) for vid in want_ids
+            if vid not in arrived and vid in id_to_index and titles_by_id.get(vid)]
+    if not jobs:
+        return []
+    # Said once rather than per track: with several running at a time the
+    # per-track lines would arrive interleaved and out of order anyway.
+    print(f"  {C.DIM}{len(jobs)} track(s) not available from the playlist, "
+          f"searching YouTube{C.RESET}", flush=True)
+    found, _ = search_many(ytdlp, jobs, target_dir, cfg)
+    return found
+
+
+def link_known(music_dir: Path, target_dir: Path, entries, id_to_index: dict,
+               ext: str) -> int:
+    """Hard-link songs we already hold in another folder instead of fetching
+    them again. Returns how many were linked.
+
+    An id is derived from the text we search for, so the same song downloaded
+    for some other playlist is the file we would end up with here anyway.
+    This is dedupe.py's trick applied *before* the download rather than after
+    it, which matters whenever a library gets reorganised into different
+    folders: without it every track is fetched a second time only to produce a
+    byte-identical file.
+    """
+    if not music_dir.exists():
+        return 0
+    elsewhere = {}
+    for folder in music_dir.iterdir():
+        if folder.is_dir() and folder != target_dir:
+            elsewhere.update(scan_existing(folder, ext))
+    if not elsewhere:
+        return 0
+
+    on_disk = scan_existing(target_dir, ext)
+    linked = 0
+    for entry in entries:
+        tid, query = entry[0], entry[1]
+        if tid in on_disk or tid not in elsewhere:
             continue
-        title = titles_by_id.get(vid)
-        if not title:
+        src = elsewhere[tid]
+        dst = target_dir / (f"{id_to_index[tid]:03d} - {sanitize_dirname(query)} "
+                            f"[{tid}]{src.suffix}")
+        if dst.exists():
             continue
-        print(f"  {C.DIM}not available from the playlist, searching YouTube:{C.RESET} {title}",
-              flush=True)
-        if search_download(ytdlp, title, vid, id_to_index[vid], target_dir, cfg):
-            recovered.append((vid, title))
-            print(f"  {C.GREEN}found a public upload:{C.RESET} {title}")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, dst)
+            linked += 1
+        except OSError:
+            pass  # another volume, or it vanished under us: just fetch it
+    return linked
+
+
+def retag_existing(target_dir: Path, have, cfg: dict, name: str):
+    """Correct the tags on files downloaded before now.
+
+    Tracks already on disk are otherwise never revisited, so a file written
+    under older tagging rules -- or whose album you have since fixed in
+    iTunes -- would keep the wrong tags until it was deleted and refetched.
+
+    Only the first file is inspected: a folder is written by one version of
+    whitefruit, so if its title is right the rest almost certainly are, and
+    probing all of them costs about 0.2s each on every run.
+    ponytail: heuristic. Probe every file if folders ever end up mixed.
+    """
+    # Same reason as in repair_folder: never retag a track adopted from your
+    # own library, or its hard link breaks and the file stops being shared.
+    have = [e for e in have if not (e[2] or {}).get("_local")]
+    if not have:
+        return
+    on_disk = scan_existing(target_dir, None)
+    first_tid, _, first_tags = have[0]
+    if (first_tid not in on_disk
+            or read_tag(on_disk[first_tid], "title") == first_tags["title"]):
+        return
+
+    print(f"[{name}] correcting tags on {len(have)} file(s) already downloaded")
+    workers = max(1, int(cfg.get("search_workers", 4) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        jobs = [pool.submit(retag, on_disk[tid], tags) for tid, _, tags in have
+                if tid in on_disk]
+        for n, _ in enumerate(as_completed(jobs), 1):
+            status(f"  {C.DIM}[{n}/{len(jobs)}] retagging…{C.RESET}",
+                   done=(n == len(jobs)))
+
+
+# Running average of how long one searched track actually takes, so the
+# estimate settles on this machine and connection instead of a fixed guess.
+_rate = {"secs": 0.0, "tracks": 0}
+
+
+def eta(tracks: int, cfg: dict) -> str:
+    """Rough time for `tracks` more searched downloads."""
+    workers = max(1, int(cfg.get("search_workers", 4) or 1))
+    if not cfg.get("concurrent_search", True):
+        workers = 1
+    if _rate["tracks"]:
+        per = _rate["secs"] / _rate["tracks"]
+    else:
+        per = 7.0 / workers  # first guess, replaced as soon as anything lands
+    secs = int(tracks * per)
+    if secs < 90:
+        return f"~{max(secs, 1)}s"
+    if secs < 5400:
+        return f"~{round(secs / 60)}m"
+    return f"~{secs / 3600:.1f}h"
+
+
+def plan_line(playlists: int, songs: int, cfg: dict, word: str = "") -> str:
+    """The "3 playlists | 412 songs | ~9m" banner."""
+    tail = f" {word}" if word else ""
+    return (f"{C.MAGENTA}{playlists} playlist(s){tail}  |  {songs} song(s){tail}"
+            f"  |  est. {eta(songs, cfg)} remaining{C.RESET}")
+
+
+def swap_to_local(target: dict) -> bool:
+    """Replace a YouTube download with the original file you already own.
+
+    The original is only ever read: it is hard-linked into the playlist folder
+    (a copy only if they sit on different volumes) and left exactly where
+    iTunes expects to find it.
+    """
+    have, local = target["have"], target["local"]
+    dst = have.with_suffix(local.suffix.lower())
+    try:
+        have.unlink()
+        try:
+            os.link(local, dst)
+        except OSError:
+            shutil.copy2(local, dst)
+        return True
+    except OSError:
+        return False
+
+
+def download_link(ytdlp: str, url: str, target: dict, cfg: dict) -> bool:
+    """Fetch one track from a link the user supplied by hand.
+
+    Same output naming and tagging as the search path, so the file drops into
+    its playlist at the right position and the next run sees it as present.
+    """
+    return search_download(ytdlp, target["query"], target["id"], target["index"],
+                           target["dir"], cfg, target["tags"], source=url)[0]
+
+
+def adopt_local(target_dir: Path, todo, id_to_index: dict, ext: str):
+    """Bring in files you already own instead of downloading them again.
+
+    Hard-linked rather than copied, so the audio is stored once and your
+    original stays exactly where iTunes expects it; a copy is only made when
+    the two are on different volumes. Either way the original file is never
+    moved, altered or deleted.
+
+    Returns the ids adopted.
+    """
+    done = []
+    for tid, query, tags in todo:
+        src = Path((tags or {}).get("_local") or "")
+        # Only formats an iPod can actually play; a FLAC or WAV you own is
+        # better re-encoded by the repair pass than linked in as-is.
+        if not (tags or {}).get("_local") or src.suffix.lower() not in settings_mod.ALL_EXTS:
+            continue
+        if not src.exists():
+            continue
+        dst = target_dir / (f"{id_to_index[tid]:03d} - {sanitize_dirname(query)} "
+                            f"[{tid}]{src.suffix.lower()}")
+        if dst.exists():
+            done.append(tid)
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, dst)
+        except OSError:
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                continue  # unreadable or gone: fall through to searching
+        done.append(tid)
+    return done
+
+
+def repair_folder(target_dir: Path, entries, id_to_index: dict, cfg: dict,
+                  ext: str, name: str) -> dict:
+    """Put one folder back in agreement with what its source says.
+
+    Everything here is a correction to files that are already downloaded, so
+    it never touches the network. Collected in one place rather than run
+    silently on every download: these are repairs, and a healthy library does
+    not need them.
+    """
+    fixed = {"retagged": 0, "renumbered": 0, "removed": 0, "stale": 0,
+             "held_back": 0}
+    on_disk = scan_existing(target_dir, None)
+    if not on_disk:
+        return fixed
+
+    # Tags, from the source rather than from whatever upload was found.
+    # Files adopted from your own library are left exactly as they are.
+    # Retagging one rewrites whitefruit's copy, and because that copy is a hard
+    # link to your file the link breaks -- leaving a second full-size copy on
+    # disk per track, silently. (Your original is never altered either way: the
+    # tag pass replaces the directory entry rather than writing through the
+    # link.) Your own tags are also likelier to be right than the source's.
+    jobs = [(on_disk[tid], tags) for tid, _, tags in entries
+            if tid in on_disk and not (tags or {}).get("_local")]
+    workers = max(1, int(cfg.get("search_workers", 4) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda j: retag(j[0], j[1]), jobs))
+    fixed["retagged"] = sum(1 for r in results if r)
+
+    before = {f.name for f in target_dir.iterdir()}
+    renumber(target_dir, id_to_index)
+    fixed["renumbered"] = len(before - {f.name for f in target_dir.iterdir()})
+
+    fixed["removed"], fixed["held_back"] = reconcile(
+        target_dir, set(id_to_index), ext, cfg, name)
+    fixed["stale"] = remove_stale_formats(target_dir, ext)
+    return fixed
+
+
+def repair_library(ytdlp: str, urls, music_dir: Path, cfg: dict):
+    """Walk every source and correct what is already on disk.
+
+    Returns (per-folder totals, folders on disk that no source claims). Those
+    orphans are the one thing it will not act on by itself: a playlist you
+    deleted upstream and a folder whitefruit never made look identical from
+    here, so the caller asks.
+    """
+    ext = settings_mod.ext_for(cfg)
+    totals = {"folders": 0, "retagged": 0, "renumbered": 0, "removed": 0,
+              "stale": 0, "held_back": 0}
+    claimed = set()
+
+    def walk(url):
+        if sources.kind(url) == "youtube":
+            name, entries, nested = get_playlist_info(ytdlp, url, cfg)
+            entries = [(vid, title, {"title": title}) for vid, title in entries]
         else:
-            print(f"  {C.YELLOW}no usable result for:{C.RESET} {title}")
-    return recovered
+            name, entries, nested = sources.resolve(url, cfg)
+        for sub in nested:
+            walk(sub)
+        if not entries:
+            return
+        name = sanitize_dirname(name)
+        claimed.add(name)
+        target_dir = music_dir / name
+        if not target_dir.exists():
+            return
+        id_to_index = {e[0]: i + 1 for i, e in enumerate(entries)}
+        got = repair_folder(target_dir, entries, id_to_index, cfg, ext, name)
+        totals["folders"] += 1
+        for k, v in got.items():
+            totals[k] += v
+        bits = ", ".join(f"{v} {k}" for k, v in got.items() if v) or "nothing to fix"
+        print(f"  {C.DIM}{name}: {bits}{C.RESET}", flush=True)
+
+    for url in urls:
+        walk(url)
+
+    orphans = sorted(f for f in music_dir.iterdir()
+                     if f.is_dir() and f.name not in claimed) if music_dir.exists() else []
+    return totals, orphans
+
+
+def process_external(ytdlp: str, url: str, music_dir: Path, cfg: dict,
+                     position=None, unresolved=None):
+    """Fetch a Spotify or Apple Music track list, then search YouTube for each
+    track. Returns (skipped, from_search) like process_playlist.
+
+    Neither service lets anything download its audio, so there is no bulk
+    yt-dlp run here: every track goes one at a time through search_download(),
+    and what arrives is whichever public upload best matched the name. That is
+    the same trade-off as the Premium fallback on the YouTube path, except it
+    applies to every track rather than the odd one, so it's stated once per
+    playlist instead of listed per track.
+    """
+    ext = settings_mod.ext_for(cfg)
+    prefix = f"{C.DIM}[{position[0]}/{position[1]}]{C.RESET} " if position else ""
+    service = "Spotify" if sources.kind(url) == "spotify" else "Apple Music"
+    status(f"  {prefix}{C.DIM}reading {service}…{C.RESET}")
+
+    name, entries, nested = sources.resolve(url, cfg)
+    name = sanitize_dirname(name)
+
+    if nested:
+        # Resolved up front, and the results kept, so the totals below are
+        # real rather than guessed -- and so nothing gets resolved twice.
+        status(f"  {prefix}{C.DIM}reading {len(nested)} playlists…{C.RESET}")
+        children = [(sub,) + sources.resolve(sub, cfg) for sub in nested]
+        songs = sum(len(e) for _, _, e, _ in children)
+        print()
+        print(f"  {prefix}{C.BOLD}{C.CYAN}{name}{C.RESET}")
+        print(f"  {plan_line(len(children), songs, cfg)}\n")
+
+        skipped, from_search = [], []
+        left = songs
+        for i, (sub, _, entries, _) in enumerate(children, 1):
+            s, f = process_external(ytdlp, sub, music_dir, cfg, (i, len(children)),
+                                    unresolved)
+            skipped += s
+            from_search += f
+            left -= len(entries)
+            if i < len(children):
+                print(f"  {plan_line(len(children) - i, left, cfg, 'left')}\n")
+        return skipped, from_search
+
+    if not entries:
+        status(f"  {prefix}{C.YELLOW}no tracks{C.RESET} {C.DIM}{url}{C.RESET}", done=True)
+        return [], []
+    status(f"  {prefix}{C.BOLD}{C.CYAN}{name}{C.RESET} "
+           f"{C.DIM}({len(entries)} tracks){C.RESET}", done=True)
+
+    target_dir = music_dir / name
+    id_to_index = {tid: i + 1 for i, (tid, *_) in enumerate(entries)}
+    linked = link_known(music_dir, target_dir, entries, id_to_index, ext)
+    if linked:
+        print(f"[{name}] {linked} track(s) already downloaded elsewhere, hard-linked")
+
+    existing = scan_existing(target_dir, ext)
+    todo = [e for e in entries if e[0] not in existing]
+
+    retag_existing(target_dir, [e for e in entries if e[0] in existing], cfg, name)
+
+    # Tracks whitefruit fetched from YouTube that you have since turned out to
+    # own. Collected rather than acted on: swapping is the user's call, and
+    # asking once at the end beats asking per playlist across thirty of them.
+    if unresolved is not None:
+        for tid, query, tags in entries:
+            local = (tags or {}).get("_local") or ""
+            if (tid in existing and local and Path(local).exists()
+                    and Path(local).suffix.lower() in settings_mod.ALL_EXTS):
+                unresolved.append({"kind": "swap", "playlist": name,
+                                   "dir": target_dir, "id": tid,
+                                   "index": id_to_index[tid], "query": query,
+                                   "tags": tags, "note": "",
+                                   "have": existing[tid], "local": Path(local)})
+
+    if not todo:
+        print(f"[{name}] up to date ({len(entries)} tracks)")
+    else:
+        print(f"[{name}] {len(todo)} track(s) to fetch. {service} audio can't be "
+              f"downloaded, so each one is searched for on YouTube. See README "
+              f"for details.")
+
+    # Anything you already own is taken from your own file; only what's left
+    # is searched for on YouTube.
+    adopted = set(adopt_local(target_dir, todo, id_to_index, ext))
+    if adopted:
+        print(f"[{name}] {len(adopted)} track(s) you already own, linked from your "
+              f"own files instead of downloading")
+    todo = [t for t in todo if t[0] not in adopted]
+
+    _, failed = search_many(
+        ytdlp, [(tid, id_to_index[tid], q, tags) for tid, q, tags in todo],
+        target_dir, cfg)
+    tags_by_id = {tid: tags for tid, _, tags in todo}
+    skipped = []
+    for tid, query, note in failed:
+        skipped.append(f"[{name}] nothing found for {query}"
+                       + (f" ({note})" if note else ""))
+        # Kept so the run can offer to take a link for these by hand at the end.
+        if unresolved is not None:
+            unresolved.append({"kind": "missing", "playlist": name,
+                               "dir": target_dir, "id": tid,
+                               "index": id_to_index[tid], "query": query,
+                               "tags": tags_by_id.get(tid), "note": note})
+
+    renumber(target_dir, id_to_index)
+    reconcile(target_dir, set(id_to_index), ext, cfg, name)
+    remove_stale_formats(target_dir, ext)
+    return skipped, []
 
 
 def process_playlist(ytdlp: str, url: str, music_dir: Path, auto_yes: bool,
-                     cfg: dict = None, position=None):
+                     cfg: dict = None, position=None, unresolved=None):
     """Returns (skipped, from_search).
 
     skipped     "[playlist] reason" strings for tracks that couldn't be
@@ -487,12 +1013,28 @@ def process_playlist(ytdlp: str, url: str, music_dir: Path, auto_yes: bool,
     cfg = cfg or settings_mod.load()
     ext = settings_mod.ext_for(cfg)
 
+    if sources.kind(url) != "youtube":
+        return process_external(ytdlp, url, music_dir, cfg, position, unresolved)
+
     # Reading a playlist is a network round trip, so say what's happening
     # rather than sitting silent until it returns.
     prefix = f"{C.DIM}[{position[0]}/{position[1]}]{C.RESET} " if position else ""
     status(f"  {prefix}{C.DIM}reading playlist…{C.RESET}")
 
-    name, entries = get_playlist_info(ytdlp, url, cfg)
+    name, entries, nested = get_playlist_info(ytdlp, url, cfg)
+    if nested:
+        # A library page: work through each playlist it holds as if it had been
+        # listed in playlists.txt on its own, so each still gets its own folder.
+        status(f"  {prefix}{C.BOLD}{name}{C.RESET} {C.DIM}({len(nested)} playlists){C.RESET}",
+               done=True)
+        skipped, from_search = [], []
+        for i, sub in enumerate(nested, 1):
+            s, f = process_playlist(ytdlp, sub, music_dir, auto_yes, cfg,
+                                    position=(i, len(nested)),
+                                    unresolved=unresolved)
+            skipped += s
+            from_search += f
+        return skipped, from_search
     if not entries:
         status(f"  {prefix}{C.YELLOW}no available tracks{C.RESET} {C.DIM}{url}{C.RESET}",
                done=True)
@@ -555,7 +1097,7 @@ def process_playlist(ytdlp: str, url: str, music_dir: Path, auto_yes: bool,
         # The playlist may have been edited while we were downloading, which
         # would make the positions we captured earlier wrong. Re-read it and
         # number from that, so a playlist edited mid-run still ends up correct.
-        _, fresh = get_playlist_info(ytdlp, url, cfg)
+        _, fresh, _ = get_playlist_info(ytdlp, url, cfg)
         if fresh and fresh != entries:
             print(f"[{name}] playlist changed while downloading "
                   f"({len(entries)} -> {len(fresh)} tracks); using the new order")

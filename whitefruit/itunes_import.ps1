@@ -1,5 +1,5 @@
 # Imports each subfolder of $srcRoot into iTunes as a playlist of the same name,
-# tracks ordered oldest-to-newest by file modified time. Re-running refills an
+# tracks in filename order, which is playlist order. Re-running refills an
 # existing playlist in place rather than appending duplicates, and leaves it
 # untouched entirely when its contents already match the folder.
 #
@@ -20,7 +20,9 @@
 param(
     # whitefruit always passes -MusicDir; this default is only for running the
     # script directly, and matches settings.py's default.
-    [string]$MusicDir = "$env:USERPROFILE\Music\whitefruit"
+    [string]$MusicDir = "$env:USERPROFILE\Music\whitefruit",
+    # Remove whitefruit's tracks from the library instead of importing them.
+    [switch]$Forget
 )
 $ErrorActionPreference = "Stop"
 $srcRoot = $MusicDir
@@ -38,6 +40,75 @@ $libraryPlaylist = $lib.Playlists | Where-Object { $_.Kind -eq 1 } | Select-Obje
 # corrupts a `return $hashtable` value. Since hashtables are reference types,
 # having the function just clear/repopulate this shared variable sidesteps
 # that entirely.
+# Take whitefruit's tracks back out of the library, and its playlists with
+# them. The files stay on disk, so re-importing puts everything back.
+#
+# Wanted before turning Sync Library on: with it on, iTunes matches or uploads
+# everything in the library into your Apple Music library, and that would
+# include every file whitefruit has downloaded.
+#
+# Only playlists that are entirely whitefruit's own files are removed. One of
+# yours that merely shares a name is left alone -- that mistake has already
+# emptied real Apple Music playlists once.
+#
+# Note this does lose the iPod's "sync this playlist" tick for the ones it
+# removes; the automation interface cannot set that back, so it has to be
+# re-ticked by hand after the next import.
+if ($Forget) {
+    $removed = 0
+
+    # Worked out BEFORE any track is deleted: once whitefruit's tracks are
+    # gone its playlists are empty, and an empty playlist is indistinguishable
+    # from an empty one of yours.
+    $ours = New-Object System.Collections.ArrayList
+    foreach ($p in $lib.Playlists) {
+        if ($p.SpecialKind -ne 0) { continue }
+        $tracks = @($p.Tracks)
+        if ($tracks.Count -eq 0) { continue }
+        $allOurs = $true
+        foreach ($t in $tracks) {
+            $loc = $t.Location
+            if (-not $loc -or -not $loc.StartsWith($srcRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $allOurs = $false
+                break
+            }
+        }
+        if ($allOurs) { [void]$ours.Add($p.Name) }
+    }
+    # Walked backwards over the live collection by index, NOT forwards over an
+    # @() snapshot. Deleting a track invalidates the references after it, so a
+    # snapshotted loop deletes the first match and then silently matches
+    # nothing else -- it reported "Removed 1" against 824 tracks. Taking the
+    # last one first leaves every lower index still valid.
+    $total = $libraryPlaylist.Tracks.Count
+    for ($i = $total; $i -ge 1; $i--) {
+        $t = $libraryPlaylist.Tracks.Item($i)
+        if (-not $t) { continue }
+        $loc = $t.Location
+        # Both tests matter: the id pattern alone would also match a file of
+        # yours that happens to be named the same way somewhere else.
+        if ($loc -and $loc -match $idPattern -and
+            $loc.StartsWith($srcRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $t.Delete() | Out-Null
+            $removed++
+        }
+    }
+    # Backwards by index for the same reason as the tracks above: deleting a
+    # playlist invalidates the references after it, so a forward pass over a
+    # snapshot removes one and then quietly matches nothing else.
+    $gone = 0
+    for ($i = $lib.Playlists.Count; $i -ge 1; $i--) {
+        $p = $lib.Playlists.Item($i)
+        if (-not $p) { continue }
+        if ($p.SpecialKind -eq 0 -and $ours -contains $p.Name) {
+            $p.Delete() | Out-Null
+            $gone++
+        }
+    }
+    Write-Output "Removed $removed of $total whitefruit track(s) and $gone playlist(s) from iTunes (files kept)"
+    exit 0
+}
+
 $idToTrack = @{}
 
 function Sync-Library {
@@ -117,16 +188,58 @@ Sync-Library
 
 # Phase 3: fill each playlist. No library-level deletions happen during this
 # phase, so cached track references stay valid.
-foreach ($folderName in $folderNames) {
+#
+# One folder's work, as a function so that a failure can simply be retried.
+# iTunes can invalidate a playlist reference underneath us -- most often while
+# Sync Library is on and the cloud sync is rewriting playlists -- after which
+# the next call against it throws "The playlist has been deleted".
+function Sync-Folder($folderName) {
     $folderPath = Join-Path $srcRoot $folderName
+    # By name, not modified time: the leading number in a filename *is* the
+    # playlist position, whereas mtime is only whenever that file happened to
+    # get written. Three things routinely make the two disagree -- searched
+    # tracks download several at a time and finish out of order, a re-encode
+    # rewrites the file, and a hard-linked duplicate carries the mtime of
+    # whichever folder was downloaded first.
     $files = @(Get-ChildItem $folderPath -File |
         Where-Object { $audioExts -contains $_.Extension.ToLower() } |
-        Sort-Object LastWriteTime)
-    if ($files.Count -eq 0) { continue }
+        Sort-Object Name)
+    # `return`, not `continue`: this is a function now, and a `continue` here
+    # would escape into the caller's loop and skip its retry bookkeeping.
+    if ($files.Count -eq 0) { return }
 
+    # Looked up fresh on every attempt, so a retry is never handed back the
+    # same stale reference that just failed.
     $playlist = $null
     foreach ($p in $lib.Playlists) {
         if ($p.SpecialKind -eq 0 -and $p.Name -ceq $folderName) { $playlist = $p; break }
+    }
+
+    # A playlist is only ours to manage if everything in it is a file we put
+    # there. Filling one means clearing it out first, so doing that to one of
+    # *your* playlists that merely shares a folder name destroys it -- and
+    # with Sync Library on, uploads the damage to your Apple Music account.
+    # Folder names come straight from your playlist names now, so this
+    # collides constantly rather than being a corner case.
+    if ($playlist) {
+        $ours = $true
+        foreach ($t in @($playlist.Tracks)) {
+            $loc = $t.Location
+            if (-not $loc -or -not $loc.StartsWith($srcRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $ours = $false
+                break
+            }
+        }
+        if (-not $ours) {
+            # Sidestep rather than refuse: the tracks still reach the iPod,
+            # under a name that can't be confused with your own playlist.
+            $folderName = "$folderName (whitefruit)"
+            $playlist = $null
+            foreach ($p in $lib.Playlists) {
+                if ($p.SpecialKind -eq 0 -and $p.Name -ceq $folderName) { $playlist = $p; break }
+            }
+            Write-Output "  '$($folderName -replace ' \(whitefruit\)$','')' is one of your own playlists; using '$folderName' instead"
+        }
     }
     if (-not $playlist) { $playlist = $itunes.CreatePlaylist($folderName) }
 
@@ -141,7 +254,7 @@ foreach ($folderName in $folderNames) {
     })
     if (($current -join "`n") -ceq ($desired -join "`n")) {
         Write-Output "Unchanged '$folderName': $($files.Count) tracks"
-        continue
+        return
     }
 
     # iTunes' COM API has no way to move a track to a given position, so the
@@ -157,8 +270,17 @@ foreach ($folderName in $folderNames) {
         if ($f.Name -match $idPattern) { $vid = $Matches[1] }
 
         if ($vid -and $idToTrack.ContainsKey($vid)) {
-            $playlist.AddTrack($idToTrack[$vid]) | Out-Null
-            continue
+            # A cached reference can go stale -- iTunes deletes the track, or a
+            # failed attempt at an earlier folder left a dead entry behind.
+            # Untreated, one dead entry then throws "The track has been
+            # deleted" on every later folder that shares that song, which is
+            # how a single failure used to take the rest of the run with it.
+            try {
+                $playlist.AddTrack($idToTrack[$vid]) | Out-Null
+                continue
+            } catch [System.Runtime.InteropServices.COMException] {
+                $idToTrack.Remove($vid)   # fall through and import it afresh
+            }
         }
 
         $status = $playlist.AddFile($f.FullName)
@@ -168,6 +290,29 @@ foreach ($folderName in $folderNames) {
         }
     }
     Write-Output "Updated '$folderName': $($files.Count) tracks"
+}
+
+foreach ($folderName in $folderNames) {
+    # Two attempts, then move on. Losing one playlist is annoying; aborting the
+    # whole run part-way leaves the library half-synced, which is worse -- and
+    # across a library's worth of folders it is near certain that one of them
+    # hits this eventually.
+    $done = $false
+    foreach ($attempt in 1, 2) {
+        try {
+            Sync-Folder $folderName
+            $done = $true
+            break
+        } catch [System.Runtime.InteropServices.COMException] {
+            Write-Output "  iTunes dropped '$folderName' mid-update (attempt $attempt): $($_.Exception.Message)"
+            Start-Sleep -Milliseconds 500
+            # A half-finished attempt leaves references in the cache that
+            # iTunes has already invalidated, so rebuild it before retrying
+            # rather than handing the retry the same dead objects.
+            Sync-Library
+        }
+    }
+    if (-not $done) { Write-Output "Skipped '$folderName': iTunes kept dropping it" }
 }
 
 # Phase 4: mop up any duplicate entries the import phase introduced.

@@ -27,14 +27,21 @@ DEFAULTS = {
     "remove_deleted": True,
     "cookies_from_browser": "none",
     "cookies_file": "",
+    "spotify_client_id": "",
     "search_fallback": True,
+    "search_workers": 4,
+    "concurrent_search": True,
+    "search_results": 3,
+    "search_youtube_music": True,
     "verbose_logging": False,
 }
 
 # Shown in the settings screen. Keep these short.
 DESCRIPTIONS = {
     "music_dir": "Where downloaded playlist folders are stored.",
-    "playlists_file": "Text file listing the playlist URLs to fetch.",
+    "playlists_file":
+    """What to fetch, one per line: YouTube Music, Spotify or Apple Music.
+       playlists.example.txt lists every accepted line.""",
     "audio_format": 
     """Output codec.
        mp3  = LAME, safest on old iPods.
@@ -63,8 +70,10 @@ DESCRIPTIONS = {
        so the folder keeps mirroring the playlist. 
        Off leaves them behind.""",
     "cookies_from_browser":
-    """Sign in using browser cookies, so tracks your account can play
-       (YouTube Premium / Music Premium) download instead of being skipped.
+    """Sign in using browser cookies.
+
+       This allows whitefruit to get a more accurate library, giving access
+       to age-restricted (explict) tracks and YouTube Premium-locked tracks.
 
        To use, select this option, choose a browser, then login to YouTube
        on said browser. Firefox is recommended.
@@ -73,10 +82,36 @@ DESCRIPTIONS = {
     "cookies_file":
     """Alternative to the above: path to a cookies.txt exported from your
        browser. Takes precedence when set. Treat with CAUTION.""",
+    "spotify_client_id":
+    """Client ID of a Spotify app (free, from developer.spotify.com/dashboard)
+       with http://127.0.0.1:8888/callback added as a redirect URI.
+       Only needed for spotify: sources in playlists.txt. There is no secret
+       to enter since sign-in happens in your browser *one* time.""",
     "search_fallback":
     """When a track can't be fetched (Premium-only, region-locked), search
-       public YouTube for the same song and take the top result instead.
-       On by default.""",
+       public YouTube for the same song and take the top result instead.""",
+    "concurrent_search":
+    """Download several tracks at the same time.
+
+       Speeds up downloads exponentially, but can *appear* to download
+       out of order, though your playlist will still finish completely intact
+       and in order.""",
+    "search_youtube_music":
+    """Search YouTube Music before plain YouTube.
+       Generally offers better results and improves metadata reliability.
+       
+       Auto falls back to plain YT when nothing matches.""",
+    "search_results":
+    """How many YouTube results to try per song before giving up.
+       The top hit is often age-restricted (which needs sign-in), so
+       trying a couple more finds a usable upload instead of reporting
+       the song as missing.""",
+    "search_workers":
+    """How many tracks to search for and download at the same time.
+       Only affects tracks fetched by search (Spotify, Apple Music, and
+       anything the playlist itself wouldn't serve). YTMusic is not impacted by this.
+
+       Higher is faster until YouTube starts rate-limiting. 1 turns it off.""",
     "verbose_logging": "Show yt-dlp's full output. Useful for debugging purposes.",
 }
 

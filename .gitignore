@@ -10,3 +10,9 @@ playlists.txt
 # exported browser cookies: as sensitive as a password
 cookies.txt
 *.cookies
+
+# spotify refresh token: reaches your account until you revoke it
+spotify_token.json
+
+# cached iTunes track lists, rebuilt by "refresh"
+library_cache.json

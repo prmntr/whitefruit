@@ -1,5 +1,7 @@
-<img width="350px" src="whitefruit/wf-wm.png" style="display: block; padding-bottom: 0; margin : auto;" />
-<h3 align="center">Sync your Youtube Music playlists to iTunes.</h3>
+<p align="center">
+  <img width="350px" src="whitefruit/wf-wm.png" />
+</p>
+<h3 align="center">Sync your Spotify, Apple Music, and Youtube Music playlists to iTunes.</h3>
 
 ## Features
 
@@ -9,42 +11,18 @@
 - **Deduplicate** repeated songs between playlists, while still maintaining playlist continuity.
 - **Re-encode** an existing library to a different format without
   redownloading it.
+- **No** python dependencies needed!
 
-## Setup
+## Prerequisites
 
 Requires `yt-dlp`, `ffmpeg`, and classic iTunes with
-COM automation, all on Windows. Both `yt-dlp` and `ffmpeg` need to be on
+COM automation, all on Windows. 
+
+> [!WARNING]
+> iTunes **must** be downloaded from Apple's [website](https://www.apple.com/itunes/download/win64), not from the Microsoft store.
+
+Both `yt-dlp` and `ffmpeg` need to be on
 `PATH` (or edit `YTDLP_FALLBACK` in `whitefruit/download.py`).
-
-Playlist URLs are listed in `playlists.txt`. 
-
-## iPod support
-
-whitefruit doesn't interface with your iPod's file system, so all iTunes-syncable iPods are supported. This includes:
-
-- iPod Classic (1st–7th)
-- iPod nano (1st–7th)
-- iPod mini (1st-2nd),
-- iPod shuffle (1st–4th)
-- iPod video (5th)
-- iPod touch (1st-7th)
-- all iTunes capable iDevices
-
-### Music Formats
-
-| Format | Setting | Notes |
-| --- | --- | --- |
-| MP3 (LAME) | `mp3` *(default)* | Plays on every iPod ever made. The safe choice. |
-| AAC | `m4a` | Smaller at the same quality, but see warning below. |
-| Apple Lossless | `alac` | 4th gen and newer only. Very large files, and older hardware can struggle to keep up. |
-
-> **Why MP3 is the default.** ffmpeg's native AAC encoder produces `.m4a`
-> files that play perfectly on a computer but can cause 
-> [scratching](https://www.reddit.com/r/ipod/comments/r2cti3/squeaking_noises_only_through_the_ipod_and_only/) sounds when played. 
-> LAME MP3 avoids the problem. Pick `m4a` only if you've
-> confirmed your device is good with it.
-
-Keep the bitrate at or below **320 kbps**. Your iPod [may](https://discussions.apple.com/thread/1819918?sortBy=rank) encounter issues with playback above it.
 
 ## Usage
 
@@ -70,6 +48,94 @@ File titles are formatted `# - Title [video_id]`.
 
 Do not remove the embedded file id, as it's how whitefruit labels songs.
 
+## Setup
+
+These links should be listed in playlists.txt.
+
+### YouTube Music
+
+| Line                                          | Fetches      |
+| --------------------------------------------- | ------------ |
+| `https://music.youtube.com/playlist?list=...` | one playlist |
+| `https://www.youtube.com/feed/playlists...`   | every playlist in library*    |
+| `https://music.youtube.com/playlist?list=LM`  | Liked Songs*  |
+
+> [!IMPORTANT]
+> *using these features requires YouTube sign-in: see [Signing in](#signing-in).
+
+### Spotify
+
+| Line                                    | Fetches                          |
+| --------------------------------------- | -------------------------------- |
+| `https://open.spotify.com/playlist/...` | one playlist                     |
+| `https://open.spotify.com/album/...`    | one album                        |
+| `spotify:liked`                         | Liked Songs, as one folder       |
+| `spotify:playlists`                     | one folder per playlist you own or follow |
+| `spotify:albums`                        | one folder per saved album       |
+
+> [!IMPORTANT]
+> **Spotify** needs a free app from the
+[developer dashboard](https://developer.spotify.com/dashboard) with
+`http://127.0.0.1:8888/callback` added as a redirect URI. Put its Client ID in
+settings under `spotify_client_id` - no secret to enter. The first
+run opens your browser once to authorise, and remembers it afterwards.
+
+### Apple Music
+
+| Line                   | Fetches                                              |
+| ---------------------- | ---------------------------------------------------- |
+| `itunes:library`       | your entire library     |
+| `itunes:playlists`     | every playlist in your library                       |
+| `itunes:playlist:Name` | one playlist, by name                         |
+| `itunes:strays`        | only library tracks that are in no playlist          |
+
+> [!IMPORTANT]
+> Downloading from Apple Music requires login and temporary sync with Apple Music through iTunes. A developer token or paid developer account are not needed. See below for instructions.
+
+To use whitefruit with Apple Music, ensure iTunes (NOT the Windows store version) is downloaded.
+
+Go to the menu bar, sign in with your Apple Music Apple ID. Make sure your iTunes library is empty (except for non-whitefruit tracks) or it will double sync your songs to Apple Music. 
+
+Sync your tracks by going to edit > preferences > iCloud Music library.
+
+Then follow the instructions in the program on when to turn on and off sync.
+
+> [!Note]
+> For greater accuracy, whitefruit takes song metadata from the source of the music, not the media downloaded from.
+
+> [!Important]
+> Apple Music and Spotify support work by taking the tracks and downloading through YouTube music. This may result in the odd clean version or cover version being mistakenly downloaded. 
+>
+> [Signing in](#signing-in) with your YouTube account can improve song search accuracy.
+
+### Music Formats
+
+| Format         | Setting           | Notes                                                                              |
+| -------------- | ----------------- | ---------------------------------------------------------------------------------- |
+| MP3 (LAME)     | `mp3` *(default)* | Plays on every iPod ever made.                                                     |
+| AAC            | `m4a`             | Smaller at the same quality, but see warning below.                                |
+| Apple Lossless | `alac`            | 4th gen and newer only. Very large files, and older hardware can struggle to play. |
+
+> **Why MP3 is the default.** ffmpeg's native AAC encoder produces `.m4a`
+> files that play perfectly on a computer but can cause 
+> [scratching](https://www.reddit.com/r/ipod/comments/r2cti3/squeaking_noises_only_through_the_ipod_and_only/) sounds when played. 
+> LAME MP3 avoids the problem. Pick `m4a` only if you've
+> confirmed your device is good with it.
+
+Keep the bitrate at or below **320 kbps**. Your iPod [may](https://discussions.apple.com/thread/1819918?sortBy=rank) encounter issues with playback above it.
+
+## iPod support
+
+whitefruit doesn't interface with your iPod's file system, so all Windows iTunes-syncable iPods are supported. This includes:
+
+- iPod Classic (2nd-7th)
+- iPod nano (1st–7th)
+- iPod mini (1st-2nd)
+- iPod shuffle (1st–4th)
+- iPod video
+- iPod touch (1st-7th)
+- all iTunes capable iDevices
+
 ## Encoding
 
 Changing output format **or sample rate** causes whitefruit to treat the
@@ -81,20 +147,16 @@ To convert what you already have instead of redownloading it, use
 Do note that re-encoding means a slight loss in audio quality. Delete
 and refetch the playlist to solve this.
 
-### Premium tracks
+## Signing in
 
-Youtube restricts some music to a YT premium subscription. whitefruit
-attempts to overcome this by using the closest match through YouTube search,
-which can sometimes bring up erroneous results.
+Signing in with YouTube allows whitefruit to get a more accurate library, giving access
+to age-restricted (explict) tracks and YouTube Premium-locked tracks (with a premium subscription).
+To use, select this option, choose a browser, then login to YouTube on said browser. Firefox is recommended.
 
-To mitigate this go to settings and select a browser
-a signed-in browser via `cookies_from_browser` (log into YouTube Music there
-first, then close the browser), or export a `cookies.txt` and set
-`cookies_file`. Firefox is the most reliable — recent Chrome versions encrypt
-their cookie store and often refuse to hand it over.
+You can also manually paste a cookie if you want.
 
-A cookie file is as sensitive as a password: it grants full access to the
-account. Keep it out of the repo and off shared machines.
+> [!Warning]
+> Take great care when signing in., especially with a cookie. This gives someone access to your *entire* youtube account.
 
 ## Deduping
 
@@ -107,7 +169,7 @@ account. Keep it out of the repo and off shared machines.
 
 whitefruit is a *personal* archiving tool. It does not host, provide or distribute any music.
 
-Download only content you own or have the right to use. Always follow YouTube’s Terms of Service and local copyright laws. We do not encourage infringing use.
+Download only content you own or have the right to use. Always follow YouTube’s Terms of Service and local copyright laws. whitefruit does not encourage infringing use.
 
 YouTube sign-in support exists so tracks *your own subscription already covers* download instead of being skipped. Signing in with a free account does **not** unlock tracks your account isn't entitled to, and it does not circimvent any additional security measures. Cookies handed
 to it are as sensitive as your password. Treat with extreme caution.

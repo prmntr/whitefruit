@@ -1,9 +1,32 @@
-# Copy this file to playlists.txt and put your own playlists in it.
+# Copy this file to playlists.txt and put your own sources in it.
 #
-# Exactly ONE YouTube Music playlist URL per line.
-# Lines starting with # are ignored.
-#
-# The playlist must be public or unlisted -- a private playlist returns
-# "The playlist does not exist" even when you're signed in.
+# One source per line. Lines starting with # are ignored.
 
+# --- YouTube Music ---------------------------------------------------------
+# A single playlist (an album URL works the same way):
 https://music.youtube.com/playlist?list=REPLACE_WITH_YOUR_PLAYLIST_ID
+
+# Or everything at once. Both of these are private to your account, so they
+# need sign-in (Settings -> cookies_from_browser); signed out they report
+# "The playlist does not exist".
+# https://www.youtube.com/feed/playlists       every playlist you own
+# https://music.youtube.com/playlist?list=LM   Liked Music
+
+# --- Spotify ---------------------------------------------------------------
+# Needs spotify_client_id in Settings. Spotify audio is DRM-protected, so
+# these only supply the track list; each song is then searched for on YouTube,
+# and the recording found may not be the one you meant.
+# https://open.spotify.com/playlist/REPLACE_WITH_PLAYLIST_ID
+# https://open.spotify.com/album/REPLACE_WITH_ALBUM_ID
+# spotify:liked       Liked Songs, as one folder
+# spotify:playlists   one folder per playlist you own or follow
+# spotify:albums      one folder per saved album
+
+# --- Apple Music -----------------------------------------------------------
+# Read out of your local iTunes library, so there is nothing to set up -- but
+# Sync Library has to be on in iTunes, or your Apple Music library isn't in
+# iTunes to be read. Each track is searched for on YouTube, same as Spotify.
+# itunes:library           everything: a folder per playlist, plus the strays
+# itunes:playlists         one folder per iTunes playlist
+# itunes:playlist:Chill    one playlist, by name
+# itunes:strays            only tracks that are in no playlist
