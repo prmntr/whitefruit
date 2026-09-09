@@ -30,6 +30,7 @@ DEFAULTS = {
     "spotify_client_id": "",
     "search_fallback": True,
     "search_workers": 4,
+    "local_music_dirs": "",
     "concurrent_search": True,
     "search_results": 3,
     "search_youtube_music": True,
@@ -106,6 +107,13 @@ DESCRIPTIONS = {
        The top hit is often age-restricted (which needs sign-in), so
        trying a couple more finds a usable upload instead of reporting
        the song as missing.""",
+    "local_music_dirs":
+    """Folders holding music you already own, separated by ';'.
+       Anything found here is used instead of being downloaded again.
+       Worth setting even if iTunes knows about the files: a library entry
+       whose file has moved keeps its name but loses its path, so the
+       track looks like a stream and gets fetched from YouTube anyway.
+       Files are read, never moved or altered.""",
     "search_workers":
     """How many tracks to search for and download at the same time.
        Only affects tracks fetched by search (Spotify, Apple Music, and

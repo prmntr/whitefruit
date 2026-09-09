@@ -68,7 +68,7 @@ def cmd_download(playlists_file=None, music_dir=None, auto_yes=False, cfg=None):
         print(f"{C.YELLOW}{C.BOLD}[!] {len(stale)} Apple Music source(s) have no "
               f"snapshot yet.{C.RESET}")
         print(f"{C.DIM}    Reading them needs Sync Library on in iTunes to allow "
-              f"whitefruit to collect your library songs. Sync library MUST be turned"
+              f"whitefruit to collect your library songs. Sync Library MUST be turned "
               f"off before whitefruit starts pushing songs to iTunes."
               f"{C.RESET}")
         if ask_yes_no("Take a snapshot first?", default=True):
@@ -141,8 +141,8 @@ def offer_local_swaps(unresolved, cfg):
         print(f"  {C.DIM}{t['playlist']}: {t['query']}{C.RESET}")
     if len(swaps) > 6:
         print(f"  {C.DIM}...and {len(swaps) - 6} more{C.RESET}")
-    print(f"{C.DIM}  whitefruit can replace with your own local files, which reduces"
-          f"disk space and may be more accurate.{C.RESET}")
+    print(f"{C.DIM}  whitefruit can replace these with your own local files, which "
+          f"reduces disk space and may be more accurate.{C.RESET}")
     if not ask_yes_no("Replace the YouTube copies with your own files?", default=True):
         return
     done = sum(1 for t in swaps if download.swap_to_local(t))
@@ -295,13 +295,21 @@ def refresh_snapshot_first(cfg, music_dir, urls):
     print(f"{C.DIM}Apple Music is compared against a snapshot, so a stale one "
           f"finds no new songs. {describe_snapshot(urls)}.{C.RESET}")
     if ask_yes_no("Re-read Apple Music first?", default=True):
-        sync_on_off(cfg, music_dir)
+        # The answer matters: saying no to "carry on anyway" after a failed
+        # clear used to be ignored, and the run downloaded and synced against
+        # whatever half-read snapshot it had.
+        return sync_on_off(cfg, music_dir)
+    return True
 
 
 def cmd_all(playlists_file=None, music_dir=None, auto_yes=True, dry_run=False, cfg=None):
     cfg = cfg or settings.load()
-    refresh_snapshot_first(cfg, Path(music_dir or cfg["music_dir"]),
-                           read_urls(Path(playlists_file or cfg["playlists_file"])))
+    if not refresh_snapshot_first(
+            cfg, Path(music_dir or cfg["music_dir"]),
+            read_urls(Path(playlists_file or cfg["playlists_file"]))):
+        print(f"{C.YELLOW}stopped before downloading — the snapshot wasn't "
+              f"refreshed{C.RESET}")
+        return
     cmd_download(playlists_file, music_dir, auto_yes, cfg)
     if cfg.get("dedupe_hardlink", True):
         cmd_dedupe(music_dir, dry_run, cfg)
@@ -310,7 +318,13 @@ def cmd_all(playlists_file=None, music_dir=None, auto_yes=True, dry_run=False, c
 
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
-    hint = "Y/n" if default else "y/N"
+    """A yes/no prompt with the default spelled out.
+
+    Always the same "[y/n]", rather than capitalising whichever one is the
+    default: the convention is easy to miss at a glance, and mixing "[Y/n]"
+    and "[y/N]" down one screen just reads as inconsistent.
+    """
+    hint = "y/n, default yes" if default else "y/n, default no"
     # A scripted run has no one to answer, and input() would raise EOFError
     # part-way through the work rather than simply taking the default.
     if not sys.stdin.isatty():
@@ -362,7 +376,13 @@ def sync_on_off(cfg, music_dir, forget=True):
               f"re-ticked. Playlists of your own are never touched.{C.RESET}")
     if forget and ask_yes_no("Clear whitefruit's tracks and playlists from iTunes?",
                              default=True):
-        itunes.forget_tracks(music_dir)
+        if not itunes.forget_tracks(music_dir):
+            print(f"{C.YELLOW}Couldn't clear whitefruit's tracks from iTunes — it "
+                  f"is probably busy.{C.RESET}")
+            print(f"{C.DIM}  They are still in the library, so turning Sync Library "
+                  f"on now would upload them into your Apple Music library.{C.RESET}")
+            if not ask_yes_no("Carry on anyway?", default=False):
+                return False
         print()
 
     # Scope. Re-reading only what's listed is the fast, predictable option;
@@ -392,8 +412,11 @@ def sync_on_off(cfg, music_dir, forget=True):
             if not ask_yes_no("Read anyway? (counts will be short)", default=False):
                 continue
 
-        read, tracks, shrunk = sources.refresh_cache(urls, cfg)
-        if tracks:
+        read, tracks, streaming, shrunk = sources.refresh_cache(urls, cfg)
+        # Tracks alone can't tell you Sync Library came on: with it off, the
+        # playlists still hold every file already on your disk. Only a track
+        # with no file of its own is Apple Music content.
+        if tracks and streaming:
             print()
             print(f"{C.GREEN}read {tracks} track(s) from {read} source(s){C.RESET}")
             if shrunk:
@@ -409,7 +432,9 @@ def sync_on_off(cfg, music_dir, forget=True):
                     continue
             break
         print()
-        print(f"{C.YELLOW}iTunes isn't showing any Apple Music tracks.{C.RESET}")
+        print(f"{C.YELLOW}iTunes isn't showing any Apple Music tracks"
+              f"{f' (only {tracks} of your own files)' if tracks else ''}"
+              f" — Sync Library looks like it is still off.{C.RESET}")
         print(f"{C.DIM}  It needs an Apple Music subscription, and iTunes can take "
               f"a minute to fill the library in after you tick it.{C.RESET}")
         if not ask_yes_no("Look again?", default=True):
@@ -667,9 +692,15 @@ def run_menu():
 
             urls = read_urls(Path(cfg["playlists_file"]))
             if any(sources.kind(u) == "itunes" for u in urls):
-                run_step("Re-reading Apple Music",
-                         lambda: refresh_snapshot_first(
-                             cfg, Path(cfg["music_dir"]), urls))
+                ok, went = run_step("Re-reading Apple Music",
+                                    lambda: refresh_snapshot_first(
+                                        cfg, Path(cfg["music_dir"]), urls))
+                if not ok or went is False:
+                    print()
+                    print(f"{C.YELLOW}Stopped: the snapshot wasn't refreshed, so "
+                          f"downloading now would work from stale data.{C.RESET}")
+                    pause()
+                    continue
 
             ok1, skipped = run_step("Downloading / updating playlists",
                                     lambda: cmd_download(cfg=cfg, auto_yes=True))

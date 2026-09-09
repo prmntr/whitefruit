@@ -32,7 +32,21 @@ $audioExts = @('.mp3', '.m4a')
 
 $itunes = New-Object -ComObject iTunes.Application
 $lib = $itunes.LibrarySource
-$libraryPlaylist = $lib.Playlists | Where-Object { $_.Kind -eq 1 } | Select-Object -First 1
+
+# iTunes exposes the library playlist directly; filtering the collection for
+# Kind -eq 1 is a second-best guess at the same thing and comes back empty
+# while iTunes is busy -- restarting, or settling after playlists were
+# deleted. That produced a bare "cannot call a method on a null-valued
+# expression" that took the whole run down.
+$libraryPlaylist = $itunes.LibraryPlaylist
+if (-not $libraryPlaylist) {
+    $libraryPlaylist = $lib.Playlists | Where-Object { $_.Kind -eq 1 } | Select-Object -First 1
+}
+if (-not $libraryPlaylist) {
+    Write-Error ("iTunes returned no library playlist. It is usually still " +
+                 "starting up or busy -- give it a moment and run this again.")
+    exit 1
+}
 
 # Mutated in place by Sync-Library rather than returned -- a PowerShell
 # function's "return value" is actually everything written to its output
@@ -80,30 +94,61 @@ if ($Forget) {
     # snapshotted loop deletes the first match and then silently matches
     # nothing else -- it reported "Removed 1" against 824 tracks. Taking the
     # last one first leaves every lower index still valid.
+    #
+    # Every COM call here is wrapped: iTunes throws part-way through a long
+    # delete often enough that an unguarded loop leaves the library half
+    # cleared AND skips the playlist pass below entirely, which is what made
+    # "clearing failed" also mean "playlists were never removed".
+    #
+    # Repeated while it is still making progress, because a track that threw
+    # on one pass usually deletes on the next.
     $total = $libraryPlaylist.Tracks.Count
-    for ($i = $total; $i -ge 1; $i--) {
-        $t = $libraryPlaylist.Tracks.Item($i)
-        if (-not $t) { continue }
-        $loc = $t.Location
-        # Both tests matter: the id pattern alone would also match a file of
-        # yours that happens to be named the same way somewhere else.
-        if ($loc -and $loc -match $idPattern -and
-            $loc.StartsWith($srcRoot, [StringComparison]::OrdinalIgnoreCase)) {
-            $t.Delete() | Out-Null
-            $removed++
+    $left = 0
+    for ($pass = 1; $pass -le 4; $pass++) {
+        $before = $removed
+        $left = 0
+        for ($i = $libraryPlaylist.Tracks.Count; $i -ge 1; $i--) {
+            try {
+                $t = $libraryPlaylist.Tracks.Item($i)
+                if (-not $t) { continue }
+                $loc = $t.Location
+                # Both tests matter: the id pattern alone would also match a
+                # file of yours that happens to be named the same way.
+                if ($loc -and $loc -match $idPattern -and
+                    $loc.StartsWith($srcRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                    $t.Delete() | Out-Null
+                    $removed++
+                }
+            } catch {
+                $left++    # iTunes objected to this one; try again next pass
+            }
         }
+        if ($left -eq 0) { break }
+        if ($removed -eq $before) { break }   # a pass that achieved nothing
+        Start-Sleep -Milliseconds 400
+    }
+    if ($left -gt 0) {
+        Write-Output "  $left track(s) would not delete; iTunes kept refusing them"
     }
     # Backwards by index for the same reason as the tracks above: deleting a
     # playlist invalidates the references after it, so a forward pass over a
     # snapshot removes one and then quietly matches nothing else.
     $gone = 0
+    $stuck = 0
     for ($i = $lib.Playlists.Count; $i -ge 1; $i--) {
-        $p = $lib.Playlists.Item($i)
-        if (-not $p) { continue }
-        if ($p.SpecialKind -eq 0 -and $ours -contains $p.Name) {
-            $p.Delete() | Out-Null
-            $gone++
+        try {
+            $p = $lib.Playlists.Item($i)
+            if (-not $p) { continue }
+            if ($p.SpecialKind -eq 0 -and $ours -contains $p.Name) {
+                $p.Delete() | Out-Null
+                $gone++
+            }
+        } catch {
+            $stuck++
         }
+    }
+    if ($stuck -gt 0) {
+        Write-Output "  $stuck playlist(s) would not delete"
     }
     Write-Output "Removed $removed of $total whitefruit track(s) and $gone playlist(s) from iTunes (files kept)"
     exit 0

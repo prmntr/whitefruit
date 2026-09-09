@@ -16,3 +16,6 @@ spotify_token.json
 
 # cached iTunes track lists, rebuilt by "refresh"
 library_cache.json
+
+# index of your own music files, rebuilt automatically
+local_index.json

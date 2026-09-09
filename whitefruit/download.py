@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from . import settings as settings_mod
 from . import sources
-from .term import C, status
+from .term import C, spinner, status
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -155,12 +155,21 @@ def reconcile(target_dir: Path, current_ids: set, ext: str, cfg: dict, name: str
     return removed, 0
 
 
-def remove_stale_formats(target_dir: Path, ext: str):
-    """Delete our own tracks left behind in a format we no longer use."""
+def remove_stale_formats(target_dir: Path, ext: str, keep_ids=()):
+    """Delete our own tracks left behind in a format we no longer use.
+
+    `keep_ids` are tracks adopted from your own library. Their format is
+    yours, not a leftover of ours to tidy up: an .m4a you own was being linked
+    in and then deleted on the same run for not being the configured mp3, so
+    the track vanished from the playlist and was never fetched either.
+    """
     removed = 0
     if not target_dir.exists():
         return 0
     for f in list(target_dir.iterdir()):
+        m = FILENAME_RE.match(f.name)
+        if m and m.group(3) in keep_ids:
+            continue
         if f.suffix.lower() in settings_mod.ALL_EXTS and f.suffix.lower() != ext \
                 and FILENAME_RE.match(f.name):
             print(f"  removing stale {f.suffix} file: {f.name}")
@@ -538,7 +547,7 @@ def search_many(ytdlp: str, jobs, target_dir: Path, cfg: dict):
     width = len(str(total))
 
     if workers > 1:
-        print(f"  {C.DIM}{workers} downloads at a time. You may notice songs finishing"
+        print(f"  {C.DIM}{workers} downloads at a time. You may notice songs finishing "
               f"in the wrong order; don't worry about that. The playlist "
               f"itself at the end keeps its order.{C.RESET}")
     print(f"  {C.DIM}searching YouTube for {total} track(s)…{C.RESET}", flush=True)
@@ -742,6 +751,19 @@ def plan_line(playlists: int, songs: int, cfg: dict, word: str = "") -> str:
             f"  |  est. {eta(songs, cfg)} remaining{C.RESET}")
 
 
+def same_file(a: Path, b: Path) -> bool:
+    """Whether two paths are the same file on disk, hard links included.
+
+    A track already swapped to your own copy IS your file -- one inode, two
+    names -- so without this it looks like an unswapped download every run and
+    gets offered again forever.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def swap_to_local(target: dict) -> bool:
     """Replace a YouTube download with the original file you already own.
 
@@ -772,7 +794,86 @@ def download_link(ytdlp: str, url: str, target: dict, cfg: dict) -> bool:
                            target["dir"], cfg, target["tags"], source=url)[0]
 
 
-def adopt_local(target_dir: Path, todo, id_to_index: dict, ext: str):
+LOCAL_INDEX = Path(__file__).resolve().parent.parent / "local_index.json"
+
+
+def local_source(tid: str, tags: dict, owned_index: dict = None):
+    """The file you already own for this track, or None.
+
+    iTunes' own path is tried first, then the index of your own folders. Both
+    are needed: a library entry can lose its path entirely when the file moves
+    (no location at all), or keep a path that no longer exists. Either way the
+    track looks like a stream and gets fetched from YouTube, and either way
+    the file is sitting on the disk.
+    """
+    named = (tags or {}).get("_local") or ""
+    for candidate in (Path(named) if named else None, (owned_index or {}).get(tid)):
+        if candidate and candidate.suffix.lower() in settings_mod.ALL_EXTS:
+            try:
+                if candidate.exists():
+                    return candidate
+            except OSError:
+                pass
+    return None
+
+
+def index_local(cfg: dict):
+    """{track_id: path} for music you own, read from your own folders.
+
+    iTunes is not a reliable answer to "do I have this file?": a library entry
+    whose file has been moved keeps the artist and title but loses the path,
+    so the track looks exactly like a stream and gets fetched from YouTube
+    even though it is sitting on the disk. This indexes the folders you name
+    in `local_music_dirs` by their real tags, giving the same track_id the
+    rest of whitefruit keys on.
+
+    Cached by path/size/mtime, so only new or changed files are probed.
+    """
+    dirs = [d.strip() for d in (cfg.get("local_music_dirs") or "").split(";")
+            if d.strip()]
+    if not dirs:
+        return {}
+    try:
+        cache = json.loads(LOCAL_INDEX.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+
+    files = [f for d in dirs if Path(d).exists()
+             for f in Path(d).rglob("*") if f.suffix.lower() in settings_mod.ALL_EXTS]
+    fresh, todo = {}, []
+    for f in files:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        key, stamp = str(f), [int(st.st_mtime), st.st_size]
+        if cache.get(key, [None, None, None])[:2] == stamp:
+            fresh[key] = cache[key]
+        else:
+            todo.append((key, stamp, f))
+
+    if todo:
+        workers = max(1, int(cfg.get("search_workers", 4) or 1))
+        with spinner(f"reading tags from {len(todo)} of your own file(s)"):
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                tags = list(pool.map(
+                    lambda j: (read_tag(j[2], "artist"), read_tag(j[2], "title")), todo))
+        for (key, stamp, _), (artist, title) in zip(todo, tags):
+            if not title:
+                continue
+            query = f"{artist} - {title}" if artist else title
+            fresh[key] = stamp + [sources.track_id(query)]
+
+    try:
+        LOCAL_INDEX.write_text(json.dumps(fresh, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    # Later files lose to earlier ones; any copy of the song will do.
+    return {v[2]: Path(k) for k, v in fresh.items() if len(v) > 2 and v[2]}
+
+
+def adopt_local(target_dir: Path, todo, id_to_index: dict, ext: str,
+                owned_index: dict = None):
     """Bring in files you already own instead of downloading them again.
 
     Hard-linked rather than copied, so the audio is stored once and your
@@ -784,12 +885,8 @@ def adopt_local(target_dir: Path, todo, id_to_index: dict, ext: str):
     """
     done = []
     for tid, query, tags in todo:
-        src = Path((tags or {}).get("_local") or "")
-        # Only formats an iPod can actually play; a FLAC or WAV you own is
-        # better re-encoded by the repair pass than linked in as-is.
-        if not (tags or {}).get("_local") or src.suffix.lower() not in settings_mod.ALL_EXTS:
-            continue
-        if not src.exists():
+        src = local_source(tid, tags, owned_index)
+        if src is None:
             continue
         dst = target_dir / (f"{id_to_index[tid]:03d} - {sanitize_dirname(query)} "
                             f"[{tid}]{src.suffix.lower()}")
@@ -957,12 +1054,24 @@ def process_external(ytdlp: str, url: str, music_dir: Path, cfg: dict,
         for tid, query, tags in entries:
             local = (tags or {}).get("_local") or ""
             if (tid in existing and local and Path(local).exists()
-                    and Path(local).suffix.lower() in settings_mod.ALL_EXTS):
+                    and Path(local).suffix.lower() in settings_mod.ALL_EXTS
+                    and not same_file(existing[tid], Path(local))):
                 unresolved.append({"kind": "swap", "playlist": name,
                                    "dir": target_dir, "id": tid,
                                    "index": id_to_index[tid], "query": query,
                                    "tags": tags, "note": "",
                                    "have": existing[tid], "local": Path(local)})
+
+    # Adopting first, so the line below reports what will really be searched
+    # for. Announcing "109 tracks to fetch" and then linking all 109 straight
+    # off your own disk is just noise.
+    adopted = set(adopt_local(target_dir, todo, id_to_index, ext,
+                              index_local(cfg)))
+    if adopted:
+        print(f"[{name}] {len(adopted)} track(s) you already own, linked from your "
+              f"own files instead of downloading")
+    todo = [t for t in todo if t[0] not in adopted]
+    owned = adopted | {e[0] for e in entries if (e[2] or {}).get("_local")}
 
     if not todo:
         print(f"[{name}] up to date ({len(entries)} tracks)")
@@ -970,14 +1079,6 @@ def process_external(ytdlp: str, url: str, music_dir: Path, cfg: dict,
         print(f"[{name}] {len(todo)} track(s) to fetch. {service} audio can't be "
               f"downloaded, so each one is searched for on YouTube. See README "
               f"for details.")
-
-    # Anything you already own is taken from your own file; only what's left
-    # is searched for on YouTube.
-    adopted = set(adopt_local(target_dir, todo, id_to_index, ext))
-    if adopted:
-        print(f"[{name}] {len(adopted)} track(s) you already own, linked from your "
-              f"own files instead of downloading")
-    todo = [t for t in todo if t[0] not in adopted]
 
     _, failed = search_many(
         ytdlp, [(tid, id_to_index[tid], q, tags) for tid, q, tags in todo],
@@ -996,7 +1097,7 @@ def process_external(ytdlp: str, url: str, music_dir: Path, cfg: dict,
 
     renumber(target_dir, id_to_index)
     reconcile(target_dir, set(id_to_index), ext, cfg, name)
-    remove_stale_formats(target_dir, ext)
+    remove_stale_formats(target_dir, ext, owned)
     return skipped, []
 
 

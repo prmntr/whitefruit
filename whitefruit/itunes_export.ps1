@@ -137,7 +137,16 @@ if ($Playlist) {
 } else {
     # Kind -eq 1 is the library playlist itself: every track, in or out of a
     # playlist, which is how stray songs and whole albums get picked up.
-    $source = $lib.Playlists | Where-Object { $_.Kind -eq 1 } | Select-Object -First 1
+    # Asked for directly rather than filtered out of the collection, which
+    # comes back empty while iTunes is busy or restarting.
+    $source = $itunes.LibraryPlaylist
+    if (-not $source) {
+        $source = $lib.Playlists | Where-Object { $_.Kind -eq 1 } | Select-Object -First 1
+    }
+    if (-not $source) {
+        [Console]::Error.WriteLine("iTunes returned no library playlist; it is probably still starting up")
+        exit 0
+    }
 }
 
 # Anything skipped is reported at the end rather than silently dropped. A

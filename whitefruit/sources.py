@@ -34,7 +34,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from .term import C, status
+from .term import C, spinner, status
 
 TOKEN_FILE = Path(__file__).resolve().parent.parent / "spotify_token.json"
 CACHE_FILE = Path(__file__).resolve().parent.parent / "library_cache.json"
@@ -366,7 +366,7 @@ def _spotify(url: str, cfg: dict):
 # Apple Music, read out of the local iTunes library
 # --------------------------------------------------------------------------
 
-def _ps(args, cfg: dict = None) -> list:
+def _ps(args, cfg: dict = None, label: str = None) -> list:
     """Run itunes_export.ps1 and return its output lines.
 
     The music dir goes with every call: it is how the script tells whitefruit's
@@ -374,10 +374,17 @@ def _ps(args, cfg: dict = None) -> list:
     """
     from . import settings as settings_mod
     music_dir = str((cfg or settings_mod.load()).get("music_dir", ""))
-    r = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", str(PS_SCRIPT), "-MusicDir", music_dir] + args,
-        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", str(PS_SCRIPT), "-MusicDir", music_dir] + args
+    # A COM read says nothing until it returns, so a label here is the
+    # difference between a spinner and a terminal that looks hung.
+    if label:
+        with spinner(label):
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+    else:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
     if r.returncode != 0:
         # A warning, not an exit. A library read walks thirty-odd playlists,
         # and one of them being unreadable is not a reason to abandon the
@@ -397,7 +404,8 @@ def _itunes(url: str):
     what = parts[1].lower() if len(parts) > 1 else "library"
 
     if what in ("library", "playlists"):
-        nested = [f"itunes:playlist:{n}" for n in _ps(["-List"])]
+        nested = [f"itunes:playlist:{n}"
+                  for n in _ps(["-List"], label="listing your iTunes playlists")]
         # "the library" means all of it: every playlist, plus whatever is in
         # the library that no playlist covers. Asking for the playlists alone
         # leaves the strays out.
@@ -414,7 +422,7 @@ def _itunes(url: str):
         sys.exit(f"unknown iTunes source: {url}")
 
     tracks = []
-    for row in _ps(args):
+    for row in _ps(args, label=f"reading {name} from iTunes"):
         # artist / title / album / album artist / location; a short row just
         # means the trailing fields were empty.
         f = (row.split("\t") + [""] * 9)[:9]
@@ -479,6 +487,21 @@ def resolve(url: str, cfg: dict, refresh: bool = False):
         if hit:
             return hit["name"], hit["entries"], hit["nested"]
     result = _itunes(url)
+    name, entries, nested = result
+
+    # A source that had tracks and now reads empty is almost never a playlist
+    # you emptied -- it is a failed read. Sync Library off, iTunes still
+    # loading, or a clear that failed and left whitefruit's own tracks in the
+    # playlist (those are skipped on read, so the playlist looks empty).
+    # Caching that turns a 604-track playlist into 0 and puts every file on
+    # disk up for deletion, so the old snapshot is kept instead.
+    prev = _load_cache().get(url)
+    if prev and prev.get("entries") and not entries and not nested:
+        print(f"  {C.YELLOW}{prev['name']}: read as empty but had "
+              f"{len(prev['entries'])} track(s) — keeping the old snapshot"
+              f"{C.RESET}", flush=True)
+        return prev["name"], prev["entries"], prev["nested"]
+
     _save_cache(url, result)
     return result
 
@@ -531,10 +554,17 @@ def refresh_cache(urls, cfg):
     and leaving Sync Library on for those hours is exactly what pushes
     whitefruit's own files back up into your Apple Music library.
 
-    Returns (sources read, tracks found, [(name, was, now) that shrank]).
+    Returns (sources read, tracks found, streaming tracks found,
+    [(name, was, now) that shrank]).
+
+    The streaming count is what says whether Sync Library is actually on: a
+    track with no file of its own is Apple Music content, whereas everything
+    else is a file already sitting on your disk. Counting playlist totals
+    can't tell the two apart -- with Sync off they still add up to thousands.
     """
     before = {u: len(v["entries"]) for u, v in _load_cache().items()}
-    seen, queue, tracks, shrunk = set(), [u for u in urls if kind(u) == "itunes"], 0, []
+    seen, queue, shrunk = set(), [u for u in urls if kind(u) == "itunes"], []
+    tracks = streaming = 0
     while queue:
         url = queue.pop(0)
         if url in seen:
@@ -549,6 +579,7 @@ def refresh_cache(urls, cfg):
         name, entries, nested = resolve(url, cfg, refresh=True)
         queue += nested
         tracks += len(entries)
+        streaming += sum(1 for e in entries if not e[2].get("_local"))
         # An empty read is the *worst* case, not one to pass over quietly:
         # it is what a playlist looks like when Sync Library never came on.
         if not entries and not nested and not was:
@@ -563,7 +594,7 @@ def refresh_cache(urls, cfg):
                   f"— was {was}{C.RESET}", flush=True)
         elif entries:
             print(f"  {C.DIM}{name}: {len(entries)} track(s){C.RESET}", flush=True)
-    return len(seen), tracks, shrunk
+    return len(seen), tracks, streaming, shrunk
 
 
 def _selfcheck():
